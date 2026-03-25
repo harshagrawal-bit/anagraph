@@ -1,0 +1,27 @@
+# Environment variables — NEVER commit these
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+.next/
+
+# Reports / local output
+backend/report_*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
