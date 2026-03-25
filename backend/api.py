@@ -1,19 +1,26 @@
 """
 Phase 4 — Flask API
-REST API wrapper for the multi-agent research system.
-Exposes the crew_main pipeline over HTTP on port 5000.
+REST API for HedgeOS research system. Port 5000.
+
+Research route strategy:
+  - Default path: brain.py (single Claude/Groq agent, ~20-40s, no crewai dependency)
+  - Full crew path: crew_main.py (6-agent CrewAI, ~90s) — pass use_crew=true in body
+  - Demo path: instant cached brief, no API calls
 
 Endpoints:
-  GET  /api/health          — health check
-  POST /api/research        — run multi-agent research for a ticker
-  GET  /api/research/{ticker} — same as POST, uses defaults
-  GET  /api/profiles        — list all fund profiles
-  POST /api/profiles        — create/update a fund profile
-  GET  /api/profiles/{fund_id} — get a specific profile
-  POST /api/profiles/{fund_id}/feedback — submit feedback
-  GET  /api/edges/{fund_id}  — get edge hypotheses for a fund
-  POST /api/edges/generate   — generate new edge hypotheses
-  GET  /api/demo/{ticker}    — return cached demo brief instantly (no API call)
+  GET  /api/health
+  POST /api/research        — body: {ticker, company, personality, fund_id, use_crew?}
+  GET  /api/research/<ticker>
+  GET  /api/demo/<ticker>
+  POST /api/demo/cache
+  GET  /api/profiles
+  POST /api/profiles
+  GET  /api/profiles/<fund_id>
+  POST /api/profiles/<fund_id>/feedback
+  GET  /api/edges/<fund_id>
+  POST /api/edges/generate
+  PATCH /api/edges/<fund_id>/<edge_id>
+  GET  /api/edges/patterns
 """
 
 import json
@@ -21,14 +28,21 @@ import os
 import sys
 from datetime import datetime, timezone
 
+# Ensure the backend root is on sys.path so brain/data_fetcher are importable
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(_HERE, ".env"))
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# Path for demo cache
-DEMO_CACHE_DIR = os.path.join(os.path.dirname(__file__), "data", "demo_cache")
+DEMO_CACHE_DIR = os.path.join(_HERE, "data", "demo_cache")
 
 
 # ─────────────────────────────────────────────────────────
@@ -37,7 +51,16 @@ DEMO_CACHE_DIR = os.path.join(os.path.dirname(__file__), "data", "demo_cache")
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "version": "1.0.0", "timestamp": datetime.now(timezone.utc).isoformat()})
+    anthropic_key = bool(os.getenv("ANTHROPIC_API_KEY"))
+    groq_key = bool(os.getenv("GROQ_API_KEY"))
+    return jsonify({
+        "status": "ok",
+        "version": "1.0.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "ai_provider": "anthropic" if anthropic_key else ("groq" if groq_key else "none"),
+        "anthropic_configured": anthropic_key,
+        "groq_configured": groq_key,
+    })
 
 
 # ─────────────────────────────────────────────────────────
@@ -47,30 +70,67 @@ def health():
 @app.post("/api/research")
 def run_research():
     """
-    Run multi-agent research for a ticker.
-    Body: {"ticker": "NVDA", "company": "Nvidia", "personality": "aggressive", "fund_id": "default"}
+    Run research for a ticker.
+
+    Body (JSON):
+      ticker      : str  — stock ticker, e.g. "NVDA"
+      company     : str  — company name (optional, defaults to ticker)
+      personality : str  — aggressive | conservative | macro | quant
+      fund_id     : str  — fund profile to use (default: "default")
+      use_crew    : bool — if true, run full 6-agent CrewAI (slower, ~90s)
+                          if false/absent, use single-agent brain (faster, ~20-40s)
+
+    Default path (use_crew=false):
+      Uses brain.py — single Claude Opus / Groq agent with fund personality.
+      No crewai dependency. Works immediately.
+
+    Crew path (use_crew=true):
+      Uses crew_main.py — 6 specialized CrewAI agents.
+      Requires crewai installed and more API budget.
     """
     data = request.get_json() or {}
     ticker = data.get("ticker", "NVDA").upper()
     company = data.get("company", ticker)
     personality = data.get("personality", "aggressive")
     fund_id = data.get("fund_id", "default")
+    use_crew = data.get("use_crew", False)
 
-    try:
-        from crew_main import run_crew
-        result = run_crew(ticker, company, personality)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    if use_crew:
+        return _run_crew_research(ticker, company, personality)
+    return _run_brain_research(ticker, company, personality)
 
 
 @app.get("/api/research/<ticker>")
 def get_research(ticker: str):
-    """GET convenience — runs research with default settings."""
+    """GET convenience — runs brain research with aggressive personality."""
+    return _run_brain_research(ticker.upper(), ticker.upper(), "aggressive")
+
+
+def _run_brain_research(ticker: str, company: str, personality: str):
+    """Fast path: single-agent brain.py — no crewai required."""
+    import asyncio
+    try:
+        from data_fetcher import fetch_all
+        from brain import generate_brief
+
+        data = asyncio.run(fetch_all(ticker, company))
+        result = generate_brief(data, personality)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e), "hint": "Check ANTHROPIC_API_KEY or GROQ_API_KEY in .env"}), 500
+
+
+def _run_crew_research(ticker: str, company: str, personality: str):
+    """Full 6-agent crew path — requires crewai."""
     try:
         from crew_main import run_crew
-        result = run_crew(ticker.upper(), ticker.upper(), "aggressive")
+        result = run_crew(ticker, company, personality)
         return jsonify(result)
+    except ImportError as e:
+        return jsonify({
+            "error": f"CrewAI not available: {e}",
+            "hint": "Install crewai in your venv: pip install crewai. Or use use_crew=false for the single-agent path."
+        }), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

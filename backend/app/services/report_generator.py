@@ -1,7 +1,6 @@
 """
 AI report generation service.
-Primary: Anthropic Claude Opus (claude-opus-4-6)
-Fallback: Groq LLaMA (free tier — for dev when no Anthropic key)
+Provider priority: OpenRouter → Anthropic direct → Groq (free fallback)
 
 Takes a 10-K document and produces a structured, fully-cited research memo.
 """
@@ -12,7 +11,22 @@ from datetime import datetime, timezone
 from app.core.config import settings
 from app.models.research import FilingMetadata, ReportResponse
 
-# --- Anthropic SDK ---
+# --- OpenRouter (primary, OpenAI-compatible) ---
+try:
+    from openai import OpenAI as _OpenAI
+    _openrouter_client = (
+        _OpenAI(
+            api_key=settings.OPEN_ROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://hedgeos.ai", "X-Title": "HedgeOS"},
+        )
+        if settings.OPEN_ROUTER_API_KEY
+        else None
+    )
+except ImportError:
+    _openrouter_client = None
+
+# --- Anthropic direct ---
 try:
     import anthropic as _anthropic
     _anthropic_client = (
@@ -23,7 +37,7 @@ try:
 except ImportError:
     _anthropic_client = None
 
-# --- Groq fallback (OpenAI-compatible) ---
+# --- Groq fallback ---
 try:
     from openai import OpenAI as _OpenAI
     _groq_client = (
@@ -33,10 +47,6 @@ try:
     )
 except ImportError:
     _groq_client = None
-
-# Claude Opus pricing (per million tokens, as of 2025)
-_CLAUDE_INPUT_COST_PER_M = 15.0
-_CLAUDE_OUTPUT_COST_PER_M = 75.0
 
 SYSTEM_PROMPT = """\
 You are a senior equity research analyst at a premier long/short hedge fund.
@@ -178,13 +188,30 @@ def _generate_with_groq(prompt: str) -> tuple:
     return text, in_tok, out_tok, 0.0
 
 
+def _generate_with_openrouter(prompt: str) -> tuple:
+    """Generate report using OpenRouter (primary provider)."""
+    response = _openrouter_client.chat.completions.create(
+        model=settings.OPEN_ROUTER_MODEL,
+        max_tokens=4096,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    text = response.choices[0].message.content
+    in_tok = response.usage.prompt_tokens
+    out_tok = response.usage.completion_tokens
+    return text, in_tok, out_tok, 0.0
+
+
 def generate_report(text: str, filing: FilingMetadata) -> ReportResponse:
     """
     Generate a structured research report from 10-K plain text.
-    Uses Claude Opus if ANTHROPIC_API_KEY is set, Groq LLaMA otherwise.
+    Provider priority: OpenRouter → Anthropic → Groq
     """
+    use_openrouter = _openrouter_client is not None and settings.use_openrouter
     use_claude = _anthropic_client is not None and settings.use_anthropic
-    max_chars = _MAX_CHARS_CLAUDE if use_claude else _MAX_CHARS_GROQ
+    max_chars = _MAX_CHARS_CLAUDE if (use_openrouter or use_claude) else _MAX_CHARS_GROQ
 
     content = _extract_sections(text, max_chars)
     prompt = REPORT_PROMPT.format(
@@ -194,15 +221,19 @@ def generate_report(text: str, filing: FilingMetadata) -> ReportResponse:
         content=content,
     )
 
-    if use_claude:
+    if use_openrouter:
+        report_text, input_tok, output_tok, cost = _generate_with_openrouter(prompt)
+        model_used = settings.OPEN_ROUTER_MODEL
+    elif use_claude:
         report_text, input_tok, output_tok, cost = _generate_with_claude(prompt)
-        model_used = settings.anthropic_model
+        model_used = "claude-opus-4-6"
     elif _groq_client is not None:
         report_text, input_tok, output_tok, cost = _generate_with_groq(prompt)
         model_used = settings.MODEL
     else:
         raise RuntimeError(
-            "No AI provider configured. Set ANTHROPIC_API_KEY or GROQ_API_KEY in .env"
+            "No AI provider configured. Set OPEN_ROUTER_API_KEY, ANTHROPIC_API_KEY, "
+            "or GROQ_API_KEY in backend/.env"
         )
 
     return ReportResponse(

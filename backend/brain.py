@@ -28,6 +28,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+OPEN_ROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
+OPEN_ROUTER_MODEL = os.getenv("OPEN_ROUTER_MODEL", "anthropic/claude-opus-4-5")
+OPEN_ROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # ─────────────────────────────────────────────────────────
 # FUND PERSONALITY PROFILES
@@ -376,19 +379,20 @@ def generate_brief(
 ) -> dict[str, Any]:
     """
     Core brain: takes a fetch_all() data package and produces a structured
-    6-section research brief using Claude Opus with the fund's personality.
+    6-section research brief.
 
-    Args:
-        data_package: Output from data_fetcher.fetch_all()
-        personality: One of "aggressive", "conservative", "macro", "quant"
-
-    Returns:
-        Dict with brief text, metadata, and cost tracking.
+    AI provider priority:
+      1. Anthropic Claude Opus (if ANTHROPIC_API_KEY set)
+      2. Groq LLaMA fallback (if GROQ_API_KEY set) — free tier, slightly lower quality
     """
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY not set in environment")
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    groq_model = os.getenv("MODEL", "llama-3.3-70b-versatile")
 
-    import anthropic
+    if not OPEN_ROUTER_API_KEY and not ANTHROPIC_API_KEY and not groq_api_key:
+        raise RuntimeError(
+            "No AI provider configured. Set OPEN_ROUTER_API_KEY (primary), "
+            "ANTHROPIC_API_KEY, or GROQ_API_KEY in backend/.env"
+        )
 
     profile = FUND_PERSONALITIES.get(personality, FUND_PERSONALITIES[DEFAULT_PERSONALITY])
 
@@ -413,25 +417,76 @@ def generate_brief(
         web_summary=web_summary,
     )
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    from openai import OpenAI
 
-    print(f"[Brain] Calling Claude Opus for {ticker} with '{profile['name']}' personality...")
+    # ── Priority 1: OpenRouter (primary) ─────────────────
+    if OPEN_ROUTER_API_KEY:
+        client = OpenAI(
+            api_key=OPEN_ROUTER_API_KEY,
+            base_url=OPEN_ROUTER_BASE_URL,
+            default_headers={
+                "HTTP-Referer": "https://hedgeos.ai",
+                "X-Title": "HedgeOS Research",
+            },
+        )
+        model_used = OPEN_ROUTER_MODEL
+        print(f"[Brain] OpenRouter ({model_used}) → {ticker} ({profile['name']})")
 
-    message = client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=3000,
-        system=system_prompt,
-        messages=[{"role": "user", "content": research_prompt}],
-    )
+        response = client.chat.completions.create(
+            model=model_used,
+            max_tokens=1500,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": research_prompt},
+            ],
+        )
+        brief_text = response.choices[0].message.content
+        input_tok = response.usage.prompt_tokens
+        output_tok = response.usage.completion_tokens
+        cost = 0.0  # varies by model on OpenRouter
+        print(f"[Brain] Done — {input_tok}in/{output_tok}out")
 
-    brief_text = message.content[0].text
-    input_tok = message.usage.input_tokens
-    output_tok = message.usage.output_tokens
+    # ── Priority 2: Anthropic direct ─────────────────────
+    elif ANTHROPIC_API_KEY:
+        import anthropic
+        ac = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        model_used = "claude-opus-4-6"
+        print(f"[Brain] Anthropic ({model_used}) → {ticker} ({profile['name']})")
 
-    # Claude Opus 4 pricing
-    cost = (input_tok * 15.0 + output_tok * 75.0) / 1_000_000
+        message = ac.messages.create(
+            model=model_used,
+            max_tokens=3000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": research_prompt}],
+        )
+        brief_text = message.content[0].text
+        input_tok = message.usage.input_tokens
+        output_tok = message.usage.output_tokens
+        cost = (input_tok * 15.0 + output_tok * 75.0) / 1_000_000
+        print(f"[Brain] Done — {input_tok}in/{output_tok}out ${cost:.4f}")
 
-    print(f"[Brain] Brief generated — {input_tok} in / {output_tok} out / ${cost:.4f}")
+    # ── Priority 3: Groq free fallback ───────────────────
+    else:
+        client = OpenAI(
+            api_key=groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        model_used = groq_model
+        print(f"[Brain] Groq ({model_used}) → {ticker} ({profile['name']})")
+
+        response = client.chat.completions.create(
+            model=model_used,
+            max_tokens=int(os.getenv("MAX_TOKENS", 4096)),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": research_prompt},
+            ],
+        )
+        brief_text = response.choices[0].message.content
+        input_tok = response.usage.prompt_tokens
+        output_tok = response.usage.completion_tokens
+        cost = 0.0
+        print(f"[Brain] Done — {input_tok}in/{output_tok}out (Groq free)")
 
     return {
         "ticker": ticker,
